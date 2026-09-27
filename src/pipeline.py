@@ -44,7 +44,12 @@ def query_candidates(db, table, row):
         if ts:
             # Prefer long terms, but retain several independent signals for
             # typos, abbreviations, and records with partial fields.
-            terms[field]=sorted(ts, key=lambda t: (len(t)<3, -len(t), t))[:3]
+            if field == "business_address":
+                # House numbers and postal codes often survive address
+                # rewriting even when every surrounding word changes.
+                terms[field]=sorted(ts, key=lambda t: (not t.isdigit(), len(t)<3, -len(t), t))[:3]
+            else:
+                terms[field]=sorted(ts, key=lambda t: (len(t)<3, -len(t), t))[:3]
     found={}
     searches=[]
     if "business_name" in terms and "business_address" in terms:
