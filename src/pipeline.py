@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 """Disk-backed, training-only entity resolution baseline for the ML Challenge 2026."""
 from __future__ import annotations
-import argparse, csv, hashlib, os, re, sqlite3, sys, time
+import argparse, csv, hashlib, math, os, re, sqlite3, sys, time
 from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -22,6 +22,36 @@ def tokens(s):
 def read_rows(path):
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         yield from csv.DictReader(f, delimiter="\t")
+
+class EmbeddingReranker:
+    def __init__(self, model_name):
+        from sentence_transformers import CrossEncoder
+        self.model = CrossEncoder(model_name, max_length=512, device="cpu")
+
+    @staticmethod
+    def text(row):
+        return " | ".join((row.get("business_name", ""), row.get("business_address", ""), row.get("country", "")))
+
+    def scores(self, row, candidates):
+        query = self.text(row)
+        pairs = [(query, self.text(candidate)) for candidate in candidates]
+        logits = self.model.predict(pairs, batch_size=8, show_progress_bar=False)
+        return [1.0 / (1.0 + math.exp(-float(logit))) for logit in logits]
+
+def candidate_options(db, row, reranker=None, tables=("train_s2", "train_s3")):
+    records=[]
+    for table in tables:
+        records.extend(query_candidates(db, table, row))
+    lexical_values=[]
+    for cand in records:
+        candidate={"business_name":cand[1],"business_address":cand[2],"country":cand[3]}
+        lexical_values.append((cand[0], score(pair_features(row, candidate)), candidate))
+    if not reranker:
+        return [(entity_id, lexical) for entity_id, lexical, _ in lexical_values]
+    shortlist=sorted(lexical_values, key=lambda item:(-item[1], item[0]))[:4]
+    embedding_scores=reranker.scores(row, [item[2] for item in shortlist])
+    reranked={item[0]:0.55 * item[1] + 0.45 * embedding_scores[index] for index, item in enumerate(shortlist)}
+    return [(entity_id, reranked.get(entity_id, lexical)) for entity_id, lexical, _ in lexical_values]
 
 def create_index(db, table, path):
     db.execute(f"DROP TABLE IF EXISTS {table}")
@@ -112,7 +142,7 @@ def f05(pred, truth):
 def split_validation(s1_id):
     return int(hashlib.md5(s1_id.encode()).hexdigest()[:8],16)%5 == 0
 
-def tune_threshold(db, source_paths, ground_truth_path, limit=None):
+def tune_threshold(db, source_paths, ground_truth_path, limit=None, reranker=None):
     truth={}
     for row in read_rows(ground_truth_path):
         truth[row["source1_entity_id"]]=set(filter(None,(row.get("matched_entity_ids") or "").split(",")))
@@ -121,11 +151,7 @@ def tune_threshold(db, source_paths, ground_truth_path, limit=None):
     for i,row in enumerate(read_rows(source_paths[0])):
         sid=row["entity_id"]
         if not split_validation(sid): continue
-        options=[]
-        for tbl in ("train_s2","train_s3"):
-            for cand in query_candidates(db,tbl,row):
-                f=pair_features(row,{"business_name":cand[1],"business_address":cand[2],"country":cand[3]})
-                options.append((cand[0],score(f)))
+        options=candidate_options(db, row, reranker)
         gold=truth.get(sid,set())
         for j,t in enumerate(thresholds):
             totals[j]+=f05({x for x,s in options if s>=t},gold)
@@ -137,7 +163,7 @@ def tune_threshold(db, source_paths, ground_truth_path, limit=None):
     best=max(range(len(vals)),key=lambda j:(vals[j],thresholds[j]))
     return thresholds[best], vals[best], n
 
-def write_outputs(root, db, threshold, out, shard_index=0, shard_count=1):
+def write_outputs(root, db, threshold, out, shard_index=0, shard_count=1, reranker=None):
     out.mkdir(parents=True,exist_ok=True)
     match_path=out/"matching_results.tsv"; cand_path=out/"candidate_pairs.tsv"
     with open(match_path,"w",encoding="utf-8",newline="") as mf, open(cand_path,"w",encoding="utf-8",newline="") as cf:
@@ -146,11 +172,7 @@ def write_outputs(root, db, threshold, out, shard_index=0, shard_count=1):
         for ix,row in enumerate(read_rows(root/"dataset/test/test_source1.tsv"),1):
             if int(hashlib.md5(row["entity_id"].encode()).hexdigest()[:8],16) % shard_count != shard_index:
                 continue
-            candidates=[]; chosen=[]
-            for tbl in ("test_s2","test_s3"):
-                for c in query_candidates(db,tbl,row):
-                    f=pair_features(row,{"business_name":c[1],"business_address":c[2],"country":c[3]})
-                    candidates.append((c[0],score(f)))
+            candidates=candidate_options(db, row, reranker, ("test_s2", "test_s3")); chosen=[]
             candidates.sort(key=lambda x:(-x[1],x[0]))
             ids=list(dict.fromkeys(x[0] for x in candidates))
             chosen=[x[0] for x in candidates if x[1]>=threshold]
@@ -169,6 +191,7 @@ def main():
     ap.add_argument("--prepare-only",action="store_true",help="build indexes/tune threshold and stop before inference")
     ap.add_argument("--shard-index",type=int,default=0,help="worker partition number, from 0 to shard-count-1")
     ap.add_argument("--shard-count",type=int,default=1,help="number of disjoint output partitions")
+    ap.add_argument("--embedding-model",default=None,help="optional local SentenceTransformer model for reranking")
     args=ap.parse_args(); data=args.data.resolve(); work=args.work.resolve(); work.mkdir(parents=True,exist_ok=True)
     db=sqlite3.connect(str(work/"entity_index.sqlite"))
     train=data/"dataset/train"; test=data/"dataset/test"
@@ -182,15 +205,16 @@ def main():
         expected={"train_s2","train_s3","test_s2","test_s3"}
         available={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not expected.issubset(available): raise RuntimeError(f"Incomplete index database; missing {sorted(expected-available)}")
+    reranker=EmbeddingReranker(args.embedding_model) if args.embedding_model else None
     if args.threshold is None:
-        threshold,val,n=tune_threshold(db,(train/"train_source1.tsv",),train/"train_ground_truth.tsv",args.validation_limit)
+        threshold,val,n=tune_threshold(db,(train/"train_source1.tsv",),train/"train_ground_truth.tsv",args.validation_limit,reranker)
         print(f"Validation macro F0.5={val:.5f} over {n} Source 1 records; selected threshold={threshold:.2f}",flush=True)
     else: threshold=args.threshold
     (work/"threshold.txt").write_text(f"{threshold:.2f}\n",encoding="utf-8")
     if args.prepare_only:
         db.close(); return
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count: raise ValueError("invalid shard index/count")
-    write_outputs(data,db,threshold,args.output.resolve(),args.shard_index,args.shard_count); db.close()
+    write_outputs(data,db,threshold,args.output.resolve(),args.shard_index,args.shard_count,reranker); db.close()
 if __name__=="__main__": main()
 
 

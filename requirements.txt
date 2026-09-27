@@ -1,1 +1,2 @@
-﻿# Python 3.10+; standard library only. SQLite must be built with FTS5.
+﻿# Python 3.10+; SQLite must be built with FTS5.
+sentence-transformers==5.1.2

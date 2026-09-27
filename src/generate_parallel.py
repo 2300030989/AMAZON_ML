@@ -10,8 +10,11 @@ def main():
     ap.add_argument('--output',type=Path,default=Path(__file__).resolve().parents[1]/'output')
     ap.add_argument('--threshold',type=float,default=None,help='defaults to work/threshold.txt')
     ap.add_argument('--workers',type=int,default=min(os.cpu_count() or 1,8))
+    ap.add_argument('--embedding-model',default=None,help='optional local CrossEncoder model for reranking')
     a=ap.parse_args(); root=Path(__file__).resolve().parents[1]; work=a.work.resolve(); data=a.data.resolve(); output=a.output.resolve()
-    workers=max(1,a.workers); shardroot=work/'shards'; shardroot.mkdir(parents=True,exist_ok=True)
+    workers=max(1,a.workers)
+    if a.embedding_model: workers=min(workers,2)
+    shardroot=work/'shards'; shardroot.mkdir(parents=True,exist_ok=True)
     if a.threshold is None:
         a.threshold=float((work/'threshold.txt').read_text(encoding='utf-8').strip())
     procs=[]; logs=[]
@@ -19,6 +22,7 @@ def main():
         shardout=shardroot/str(i)/'output'; shardout.mkdir(parents=True,exist_ok=True)
         logpath=shardroot/f'worker_{i}.log'; log=open(logpath,'w',encoding='utf-8')
         cmd=[sys.executable,str(root/'src'/'pipeline.py'),'--data',str(data),'--work',str(work),'--output',str(shardout),'--threshold',str(a.threshold),'--reuse-index','--shard-index',str(i),'--shard-count',str(workers)]
+        if a.embedding_model: cmd.extend(['--embedding-model',a.embedding_model])
         procs.append(subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT)); logs.append(log)
     last_report=0
     while True:
